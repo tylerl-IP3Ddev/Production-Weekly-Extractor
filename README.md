@@ -62,6 +62,7 @@ Your extracted folder should look like:
 ```
 
 Do **not** remove the PNG or ICO — they are used by the UI.
+
 The Production_Weekly_Extractor.exe can be found in the ...\dist\Production_Weekly_Extractor\Production_Weekly_Extractor.exe
 ---
 
