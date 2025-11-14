@@ -19,10 +19,19 @@ Version 1 is fully packaged as a Windows executable — **no Python or external 
 4. Inside the extracted folder, you’ll see:
 
 ```
-Production_Weekly_Extractor.exe
+/Production Weekly Extractor/
+    __pycache__
+    build
+    dist
+    venv
+    Production_Weekly_Extractor.py
+    Production_Weekly_Extractor.spec
+    PW_Extractor_Long-01-01
+    PW_Extractor-01-01-01
+    remove_bottom_watermark
 ```
-
-5. Double-click **`Production_Weekly_Extractor.exe`** to launch the tool.
+5. Open dist folder
+6. Double-click **`Production_Weekly_Extractor.exe`** to launch the tool.
 
 ---
 
