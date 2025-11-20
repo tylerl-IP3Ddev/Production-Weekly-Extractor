@@ -1,0 +1,10 @@
+pymupdf
+pandas
+rapidfuzz
+geonamescache
+openpyxl
+python-dateutil
+regex
+pillow
+tk
+pycountry

@@ -32,11 +32,12 @@ import re
 
 import sys, os
 
-def resource_path(relative_path):
-    """ For PyInstaller to find bundled files """
-    if hasattr(sys, '_MEIPASS'):
-        return os.path.join(sys._MEIPASS, relative_path)
-    return os.path.join(os.path.abspath("."), relative_path)
+
+def resource_path(relative: str) -> Path:
+    """Return absolute path to resource (handles PyInstaller and dev)."""
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return base / relative
+
 
 
 _MONTHS = {m.lower(): i for i, m in enumerate(
@@ -66,7 +67,7 @@ def _parse_span_flexible(s: str):
 
         if end < start:
             # Crosses the New Year (e.g., Nov–Mar)
-            start = dt.date(year - 1, a, d1)
+            start = dt.date(y - 1, a, d1)
         return (start, end)
     except Exception:
         return None
@@ -411,6 +412,7 @@ SCHEMA = [
     "Notes",
     "Category",
     "All Locations",
+    "Status Raw",
 ]
 
 # For comparison CSV: put Category + Notes right after title
@@ -440,7 +442,7 @@ MASTER_SCHEMA = [
     "Studio Name",
     "Production Office",
     "Production Phone/Email",
-    "Prod. Co",  
+    "Prod. Co",
 
 ]
 
@@ -780,6 +782,7 @@ def _parse_block_to_row(block_text: str) -> Tuple[Dict[str,str], str, bool]:
     row["Notes"] = ""
     row["Category"] = ""
     row["All Locations"] = location_val
+    row["Status Raw"] = status_val
     return row, title, is_excluded
 # ---------------- MASTER COMPARE ----------------
 
@@ -1091,56 +1094,81 @@ def master_compare_cmd(
         w.writeheader()
         w.writerows(diff_rows_master)
 
-    print(f"[master-compare] Wrote: {out_master}")
+        print(f"[master-compare] Wrote: {out_master}")
 
-    # --- Summary / metrics ---
+    # --- Summary / metrics for this weekly/master run ---
     def _truthy(v: str) -> bool:
         return (v or "").strip().lower() in {"y", "yes", "true", "1"}
 
-    total_pw = len(base_titles)  # includes filtered productions (from weekly_baseline)
-    pushed_count = sum(1 for r in diff_rows_master if _truthy(r.get("Date Pushed Back?","")))
+    def _status_snippet(row: dict) -> str:
+        # Use the parsed Status Raw field directly
+        return (row.get("Status Raw", "") or "").strip().lower()
+
+
+    # "No filter" = all titles PW saw in this issue (baseline list)
+    total_unfiltered_issue = len(base_titles)
+
+    # "After filter" = all rows that made it into the FullSchema CSV
+    total_filtered_issue = len(weekly_rows)
+
+    # Pushed back is computed from the master-compare diff rows
+    pushed_count = sum(
+        1 for r in diff_rows_master
+        if _truthy(r.get("Date Pushed Back?", ""))
+    )
+
+    # Dev count based on the filtered FullSchema rows only
+    dev_filtered_issue = 0
+    for r in weekly_rows:
+        s = _status_snippet(r)
+        if "development" in s:
+            dev_filtered_issue += 1
 
     if summary_acc is not None:
         # Batch mode: accumulate metrics instead of writing a per-region summary
-        if "total_pw" not in summary_acc:
-            summary_acc["total_pw"] = total_pw
+
+        # These don't change per region (same weekly files each time),
+        # so only set them once.
+        if "total_unfiltered_issue" not in summary_acc:
+            summary_acc["total_unfiltered_issue"] = total_unfiltered_issue
+        if "total_filtered_issue" not in summary_acc:
+            summary_acc["total_filtered_issue"] = total_filtered_issue
+        if "dev_filtered_issue" not in summary_acc:
+            summary_acc["dev_filtered_issue"] = dev_filtered_issue
+
         summary_acc["pushed_total"] = summary_acc.get("pushed_total", 0) + pushed_count
+
         files = summary_acc.setdefault("files", [])
         files.append({
             "region": region or "All Regions",
-            "weekly_csv": weekly_csv.name,
+            "weekly_csv": Path(weekly_csv).name,
             "weekly_baseline": Path(weekly_baseline).name,
             "master_compare": out_master.name,
         })
     else:
-        # Single-region / CLI: keep existing per-region summary behavior
+        # Single-region / CLI summary
         summary_txt = outdir / f"PW_{latest_date_for_filename}_SUMMARY.txt"
         summary_txt.write_text(
             "\n".join([
                 f"Production Weekly Summary — {weekly_label} ({region or 'All Regions'})",
                 "",
-                f"Total productions this issue (including filtered): {total_pw}",
+                "Note: totals below only include productions that appear in this",
+                "master comparison (region-filtered and aligned to the master CSV).",
+                "For raw issue-wide totals, see the BUILD_SUMMARY from the Build step.",
+                "",
+                f"Total productions (no filter, from baseline titles): {total_unfiltered_issue}",
+                f"Total productions (after filters / FullSchema rows, Hallmark/Telefilm/GAF removed): {total_filtered_issue}",
                 f"Productions with DATE PUSHED BACK: {pushed_count}",
+                f"Productions in development (STATUS contains 'development', after filters, all regions, Hallmark/Telefilm/GAF removed): {dev_filtered_issue}",
                 "",
                 "Files:",
-                f"- Weekly FullSchema: {weekly_csv.name}",
+                f"- Weekly FullSchema: {Path(weekly_csv).name}",
                 f"- Baseline (incl. filtered): {Path(weekly_baseline).name}",
                 f"- Master Compare: {out_master.name}",
             ]),
             encoding="utf-8",
         )
         print(f"[summary] Wrote: {summary_txt}")
-
-def find_master_csv(master_dir: Path, region: str) -> Path:
-    # Map dropdown region to expected filename suffix
-    region_key = REGION_FILE_MAP.get(region, region)
-    target = region_key.lower().replace(" ", "").replace("_", "").replace("-", "")
-    for f in master_dir.glob("*.csv"):
-        stem = f.stem.lower().replace(" ", "").replace("_", "").replace("-", "")
-        if target in stem:
-            return f
-    raise FileNotFoundError(f"No master CSV found in {master_dir} matching region '{region}'")
-
 
 # --------- World gazetteer (offline) ----------
 _gc = geonamescache.GeonamesCache()
@@ -1956,17 +1984,71 @@ def build_cmd(input_path: Path, outdir: Path, label: str):
     baseline   = outdir / f"{safe_label}_baseline_titles.txt"
     filtered   = outdir / f"{safe_label}_filtered_titles.txt"
 
-    filtered_titles=[]; kept_rows=[]
+    total_unfiltered = len(titles)          # everything PW saw in the issue
+
+    # Development counts (no filter vs after EXCLUDE_KEYWORDS)
+    dev_unfiltered = 0
+    dev_filtered = 0
+
+    # Split out Active Development vs plain Development
+    dev_active_unfiltered = 0
+    dev_active_filtered = 0
+    dev_plain_unfiltered = 0
+    dev_plain_filtered = 0
+
+
+    def _status_from_row(row: dict) -> str:
+        """
+        Pull STATUS text from the Description using RE_STATUS.
+        Returns lowercase string or ''.
+        """
+        desc = (row.get("Description", "") or "")
+        m = RE_STATUS.search(desc)
+        if m:
+            return m.group(1).strip().lower()
+        return ""
+
+    filtered_titles = []
+    kept_rows = []
+
     for b in blocks:
         row, title, is_excluded = _parse_block_to_row(b)
+
+        # Count development BEFORE we apply Hallmark/Telefilm/GAF exclusion
+        status_text = (row.get("Status Raw","")or "").lower()  # lowercase STATUS snippet
+
+        if "development" in status_text:
+            dev_unfiltered += 1
+
+            # Is it explicitly "Active Development" (or any status that contains both)
+            is_active_dev = "active" in status_text
+
+            if is_active_dev:
+                dev_active_unfiltered += 1
+            else:
+                dev_plain_unfiltered += 1
+
+            # After filters (Hallmark/Telefilm/GAF etc.)
+            if not is_excluded:
+                dev_filtered += 1
+                if is_active_dev:
+                    dev_active_filtered += 1
+                else:
+                    dev_plain_filtered += 1
+
         if is_excluded:
             filtered_titles.append(title)
             continue
+
         kept_rows.append(fill_na(row))
 
+    total_filtered = len(kept_rows)  # after Hallmark/GAF/etc filters
+
+    # --- Write main CSV + side text files ---
     with csv_path.open("w", newline="", encoding="utf-8-sig") as f:
         w = csv.DictWriter(f, fieldnames=SCHEMA, extrasaction="ignore")
-        w.writeheader(); w.writerows(kept_rows)
+        w.writeheader()
+        w.writerows(kept_rows)
 
     baseline.write_text("\n".join(titles), encoding="utf-8")
     filtered.write_text("\n".join(filtered_titles), encoding="utf-8")
@@ -1974,7 +2056,80 @@ def build_cmd(input_path: Path, outdir: Path, label: str):
     print(f"[build] Wrote {len(kept_rows)} rows to {csv_path}")
     print(f"[build] Baseline (incl. filtered): {len(titles)} titles -> {baseline.name}")
     print(f"[build] Filtered titles ({len(filtered_titles)}): {filtered.name}")
+
+    # --- Build-level summary: unfiltered vs filtered totals ---
+    build_summary = outdir / f"{safe_label}_BUILD_SUMMARY.txt"
+    lines = [
+        f"Production Weekly Build Summary — {label}",
+        "",
+        "Note: totals below are parsed directly from this issue's PDF.",
+        "Counts marked 'no filter' include Hallmark / Telefilm / GAF etc.",
+        "Counts marked 'after filters' exclude those titles from the CSV,",
+        "but they are still reflected in the no-filter totals for trend tracking.",
+        "",
+        f"Total productions: {total_unfiltered} (no filter) / {total_filtered} (after filters)",
+        "",
+        "Productions in development (STATUS contains 'development'):",
+        f"  - All development: {dev_unfiltered} (no filter) / {dev_filtered} (after filters)",
+        f"  - Active development: {dev_active_unfiltered} (no filter) / {dev_active_filtered} (after filters)",
+        f"  - Development (not marked active): {dev_plain_unfiltered} (no filter) / {dev_plain_filtered} (after filters)",
+        "",
+        f"Source FullSchema CSV: {csv_path.name}",
+        f"Baseline titles (incl. filtered): {baseline.name}",
+        f"Filtered titles list: {filtered.name}",
+    ]
+    build_summary.write_text("\n".join(lines), encoding="utf-8")
+    print(f"[build-summary] Wrote: {build_summary}")
+
     return str(csv_path), str(baseline), str(filtered)
+
+
+def write_build_summary_from_fullschema(csv_path: Path):
+    """
+    Per-build summary based on the FullSchema CSV only.
+    No master-compare / region filtering.
+    """
+    rows = _read_csv_rows(Path(csv_path))
+
+    def _truthy(v: str) -> bool:
+        return (v or "").strip().lower() in {"y", "yes", "true", "1"}
+
+    total = len(rows)
+    active = sum(1 for r in rows if _truthy(r.get("Actively in Production", "")))
+
+    # Pull STATUS text out of Description using RE_STATUS (from bottom of file)
+    def _status_from_desc(row: dict) -> str:
+        desc = (row.get("Description", "") or "")
+        m = RE_STATUS.search(desc)
+        if m:
+            return m.group(1).strip().lower()
+        return ""
+
+    dev = 0
+    for r in rows:
+        status = _status_from_desc(r)
+        if "development" in status:
+            dev += 1
+
+    base = Path(csv_path).stem.replace("_FullSchema", "")
+    summary_txt = Path(csv_path).parent / f"{base}_BUILD_SUMMARY.txt"
+
+    lines = [
+        f"Production Weekly Build Summary — {base}",
+        "",
+        "Note: totals below are based on ALL rows in the FullSchema CSV,",
+        "before any master-compare / region filtering.",
+        "",
+        f"Total productions parsed into FullSchema: {total}",
+        f"Productions actively in production (Actively in Production = Yes): {active}",
+        f"Productions in development (STATUS contains 'development'): {dev}",
+        "",
+        f"Source FullSchema CSV: {Path(csv_path).name}",
+    ]
+    summary_txt.write_text("\n".join(lines), encoding="utf-8")
+    print(f"[build-summary] Wrote: {summary_txt}")
+
+
 
 # ---------- COMPARE ----------
 def _read_csv_rows(path: Path) -> List[Dict[str,str]]:
@@ -2309,7 +2464,8 @@ def main():
             glob_pattern=args.glob,
             skip_clean=(not args.no_skip_clean),
             resume=(not args.no_resume)
-    )
+         )   
+
     
 
     else:
@@ -2349,9 +2505,67 @@ TABLE_STRIPE = MID_GREY
 
 
 class ProductionWeeklyGUI:
+    def _load_logo(self, parent):
+        """Load banner image PNG safely in script and PyInstaller EXE."""
+        try:
+            base_path = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+        except Exception:
+            base_path = Path(__file__).resolve().parent
+
+        logo_path = base_path / "PW_Extractor_Long-01-01.png"
+
+        try:
+            # Load full-size image
+            orig_img = tk.PhotoImage(file=str(logo_path))
+
+            # ---- SCALE LOGO ----
+            MAX_WIDTH = 500  # <–– change this to size you want
+            w = orig_img.width()
+            h = orig_img.height()
+
+            if w > MAX_WIDTH:
+                scale_factor = w / MAX_WIDTH
+                new_w = int(w / scale_factor)
+                new_h = int(h / scale_factor)
+
+                # Use subsample for downscaling in Tk
+                subsample_factor = int(scale_factor)
+                resized_img = orig_img.subsample(subsample_factor)
+            else:
+                resized_img = orig_img
+
+            self.logo_img = resized_img
+
+            label = tk.Label(
+                parent,
+                image=self.logo_img,
+                bg=WINDOW_BG,
+                borderwidth=0,
+                highlightthickness=0
+            )
+            label.pack(pady=(10, 10))
+
+        except Exception as e:
+            print("Failed to load banner logo:", e)
+
     def __init__(self, root: tk.Tk):
         self.root = root
         root.title("IP Production Weekly Extractor")
+        root.configure(bg=WINDOW_BG)
+
+        # we keep a reference so Tk doesn't GC the image
+        self.logo_img = None
+
+        # ---- ttk style ----
+        style = ttk.Style(root)
+        style.theme_use("clam")
+
+        # Frames
+        style.configure("Dark.TFrame", background=WINDOW_BG)
+        style.configure("Card.TFrame", background=CARD_BG)  # used mainly for preview
+
+        # ...leave the rest of your existing style / widget code exactly as-is...
+
         root.configure(bg=WINDOW_BG)
 
         self.logo_img = None
@@ -2511,57 +2725,6 @@ class ProductionWeeklyGUI:
         self._master_tab()
         self._toolbar()
 
-    # ---------- Logo loader ----------
-    def _load_logo(self, parent: ttk.Frame):
-        """
-        Load PW_Extractor_Long-01-01.png, center it, and offset slightly left.
-        Header height is driven by the logo height so it doesn't sit under the box.
-        """
-        try:
-            script_dir = Path(__file__).resolve().parent
-        except NameError:
-            script_dir = Path(".").resolve()
-        logo_path = script_dir / "PW_Extractor_Long-01-01.png"
-
-        if logo_path.exists():
-            try:
-                img = Image.open(logo_path)
-                max_w = 420
-                if img.width > max_w:
-                    ratio = max_w / img.width
-                    img = img.resize(
-                        (int(img.width * ratio), int(img.height * ratio)),
-                        Image.LANCZOS
-                    )
-
-                self.logo_img = ImageTk.PhotoImage(img)
-
-                label = ttk.Label(
-                    parent,
-                    image=self.logo_img,
-                    style="Logo.TLabel"
-                )
-                # Centered, nudged left by giving more padding on the right
-                label.pack(expand=True, pady=(4, 4), padx=(0, 50))
-
-                # Now that we know the rendered height, lock the header to it
-                parent.update_idletasks()
-                header_h = self.logo_img.height() + 8  # a little breathing room
-                parent.configure(height=header_h)
-                parent.pack_propagate(False)
-                return
-            except Exception:
-                pass
-
-        # Fallback text banner (still centered)
-        parent.pack_propagate(True)
-        box = ttk.Frame(parent, style="Dark.TFrame")
-        box.pack(expand=True)
-        ttk.Label(box, text="INDUSTRIAL PIXEL",
-                style="Title.TLabel").grid(row=0, column=0, sticky="n")
-        ttk.Label(box,
-                text="3D STUDIOS · PRODUCTION WEEKLY EXTRACTOR",
-                style="Subtitle.TLabel").grid(row=1, column=0, sticky="n", pady=(2, 0))
 
         # ---------- small helpers shared by the GUI ----------
 
@@ -2890,6 +3053,8 @@ class ProductionWeeklyGUI:
 
             csv_path, baseline, filtered = build_cmd(input_for_build, outdir, label)
 
+                        # NEW: per-build global summary from FullSchema
+
             try:
                 fullschema = max(Path(outdir).glob("*_FullSchema.csv"),
                                  key=lambda p: p.stat().st_mtime)
@@ -3168,27 +3333,41 @@ class ProductionWeeklyGUI:
 
             weekly_csv, weekly_baseline, weekly_label = resolve_run_folder(weekly_dir)
 
-            # --- Batch: run all regions and write ONE combined summary ---
+            # --- Batch: run ALL regions and write ONE combined summary ---
             if region == "All Regions (batch)":
                 summary_acc: dict = {}
+
                 for reg in REGION_FILE_MAP.keys():
                     master_compare_cmd(
                         Path(master_dir),
-                        Path(weekly_csv), Path(weekly_baseline), weekly_label,
-                        Path(outdir), latest_date,
+                        Path(weekly_csv),
+                        Path(weekly_baseline),
+                        weekly_label,
+                        Path(outdir),
+                        latest_date,
                         region=reg,
                         summary_acc=summary_acc,
                     )
 
-                total_pw = summary_acc.get("total_pw", 0)
+                total_unfiltered_issue = summary_acc.get("total_unfiltered_issue", 0)
+                total_filtered_issue = summary_acc.get("total_filtered_issue", 0)
+                dev_filtered_issue = summary_acc.get("dev_filtered_issue", 0)
                 pushed_total = summary_acc.get("pushed_total", 0)
+
                 summary_txt = outdir / f"PW_{latest_date}_SUMMARY.txt"
 
                 lines = [
                     f"Production Weekly Summary — {weekly_label} (ALL REGIONS)",
                     "",
-                    f"Total productions this issue (including filtered): {total_pw}",
+                    "Note: totals below only include productions that made it into the",
+                    "master comparison (region-filtered and matched against the master CSV).",
+                    "For raw issue-wide totals (including Hallmark/GAF/etc),",
+                    "see the BUILD_SUMMARY produced by the Build step.",
+                    "",
+                    f"Total productions (no filter, from baseline titles): {total_unfiltered_issue}",
+                    f"Total productions (after filters / FullSchema rows, Hallmark/Telefilm/GAF removed): {total_filtered_issue}",
                     f"Productions with DATE PUSHED BACK (all regions): {pushed_total}",
+                    f"Productions in development (STATUS contains 'development', after filters, all regions, Hallmark/Telefilm/GAF removed): {dev_filtered_issue}",
                     "",
                     "Files:",
                 ]
@@ -3205,40 +3384,45 @@ class ProductionWeeklyGUI:
                     f"Output folder:\n{outdir}",
                 )
 
-            # --- Single region: per-region summary + preview ---
             else:
+                # Single-region run
                 master_compare_cmd(
                     Path(master_dir),
-                    Path(weekly_csv), Path(weekly_baseline), weekly_label,
-                    Path(outdir), latest_date,
-                    region=region or "",
+                    Path(weekly_csv),
+                    Path(weekly_baseline),
+                    weekly_label,
+                    Path(outdir),
+                    latest_date,
+                    region=region,
                 )
 
+                # Try to preview the VS_MASTER CSV for this region
                 safe_region = (region or "All")
                 for bad in ("/", "\\", ":", "*", "?", "\"", "<", ">", "|"):
                     safe_region = safe_region.replace(bad, "_")
                 safe_region = safe_region.replace(" ", "_")
 
-                out_file = outdir / f"PW_{latest_date}_VS_MASTER_{safe_region}.csv"
-                if out_file.exists():
-                    self._show_preview(str(out_file))
-                else:
-                    messagebox.showinfo(
-                        "Done",
-                        f"Master compare finished but output file not found:\n{out_file}",
-                    )
+                csv_path = outdir / f"PW_{latest_date}_VS_MASTER_{safe_region}.csv"
+                if csv_path.exists():
+                    self._show_preview(str(csv_path))
 
-            self._set_status("Ready")
+                messagebox.showinfo(
+                    "Master Compare Complete",
+                    f"Master compare finished for region: {region or 'All'}\n\n"
+                    f"Output folder:\n{outdir}",
+                )
+
+            self._set_status("Ready", busy=False)
 
         except Exception as e:
-            self._set_status("Error")
+            self._set_status("Error", busy=False)
             messagebox.showerror(
                 "Master Compare Error",
                 f"{e.__class__.__name__}: {e}",
             )
 
 
-        
+
     def preview_master_compare_csv(self):
         """Open an already-built VS_MASTER CSV for the selected region/date
         without re-running the compare."""
@@ -3344,9 +3528,8 @@ class ProductionWeeklyGUI:
 
 def launch_gui():
     root = tk.Tk()
-    ProductionWeeklyGUI(root)
+    gui = ProductionWeeklyGUI(root)
     root.mainloop()
-
 
 if __name__ == "__main__":
     launch_gui()
